@@ -1,0 +1,192 @@
+# TEMPORARY INVESTIGATION PROBE -- NOT A FIX, NOT FOR MERGE.
+#
+# Determines the configuration scope of the OQS_destroy()/OQS_init() defect.
+# Every cell declares, in the matrix itself, the outcome predicted BEFORE the
+# run. The step compares the observed exit code against that prediction, so a
+# GREEN job means "prediction confirmed" and a RED job means "prediction wrong".
+# Cells predicted to survive are the controls: a red probe cell with no green
+# control cell would prove nothing.
+#
+# Scoped to the scratch branch only, so it cannot fire on anything else.
+
+name: zz-probe OQS_destroy scope (DO NOT MERGE)
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - scratch/probe-oqs-destroy-scope-DO-NOT-PR
+
+env:
+  MIN_BUILD: KEM_frodokem_640_aes;SIG_ml_dsa_44
+
+jobs:
+
+  scope-matrix:
+    name: ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    container: openquantumsafe/ci-ubuntu-latest:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PROBE: pthreads on, algorithm that uses the OpenSSL AES path.
+          - id: A1-pthreads-on--openssl-aes-kem
+            extra_args: -DOQS_DIST_BUILD=OFF
+            kind: kem
+            alg: FrodoKEM-640-AES
+            predict: die
+          # CONTROL: pthreads on, algorithm that touches no fetched object.
+          - id: A2-pthreads-on--ml-dsa-44-CONTROL
+            extra_args: -DOQS_DIST_BUILD=OFF
+            kind: sig
+            alg: ML-DSA-44
+            predict: survive
+          # PROBE: pthreads on, SHA3 routed through OpenSSL, so even ML-DSA
+          # now depends on a fetched object.
+          - id: A3-pthreads-on--sha3-openssl--ml-dsa-44
+            extra_args: -DOQS_DIST_BUILD=OFF -DOQS_USE_SHA3_OPENSSL=ON
+            kind: sig
+            alg: ML-DSA-44
+            predict: die
+          # CONTROL: same as A1 but pthreads off (via OQS_EMBEDDED_BUILD).
+          - id: B1-pthreads-off--openssl-aes-kem-CONTROL
+            extra_args: -DOQS_DIST_BUILD=OFF -DOQS_EMBEDDED_BUILD=ON
+            kind: kem
+            alg: FrodoKEM-640-AES
+            predict: survive
+          # CONTROL: same as A3 but pthreads off.
+          - id: B2-pthreads-off--sha3-openssl--ml-dsa-44-CONTROL
+            extra_args: -DOQS_DIST_BUILD=OFF -DOQS_EMBEDDED_BUILD=ON -DOQS_USE_SHA3_OPENSSL=ON
+            kind: sig
+            alg: ML-DSA-44
+            predict: survive
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v4
+
+      - name: Configure
+        run: |
+          mkdir build
+          cd build
+          cmake -GNinja ${{ matrix.extra_args }} -DOQS_MINIMAL_BUILD="$MIN_BUILD" ..
+          echo "----- resolved config -----"
+          grep -E 'OQS_USE_OPENSSL|OQS_USE_PTHREADS|OQS_USE_AES_OPENSSL|OQS_USE_SHA2_OPENSSL|OQS_USE_SHA3_OPENSSL|OQS_EMBEDDED_BUILD' include/oqs/oqsconfig.h
+
+      - name: Build liboqs
+        run: ninja oqs
+        working-directory: build
+
+      - name: Build probe
+        run: cc -I build/include -o probe .probe/probe_destroy_scope.c build/lib/liboqs.a -lcrypto -lpthread
+
+      - name: Run probe and compare against the prediction
+        run: |
+          set +e
+          ./probe "${{ matrix.kind }}" "${{ matrix.alg }}"
+          rc=$?
+          set -e
+          echo "OBSERVED-EXIT-CODE=$rc"
+          echo "PREDICTED=${{ matrix.predict }}"
+          if [ "$rc" = "77" ]; then
+            echo "RESULT=INCONCLUSIVE (algorithm not enabled in this build)"
+            exit 1
+          fi
+          if [ "${{ matrix.predict }}" = "survive" ]; then
+            if [ "$rc" = "0" ]; then
+              echo "RESULT=PREDICTION-CONFIRMED (survived)"
+            else
+              echo "RESULT=PREDICTION-WRONG (expected survive, got exit $rc)"
+              exit 1
+            fi
+          else
+            if [ "$rc" = "0" ]; then
+              echo "RESULT=PREDICTION-WRONG (expected die, but it survived)"
+              exit 1
+            else
+              echo "RESULT=PREDICTION-CONFIRMED (died with exit $rc)"
+            fi
+          fi
+
+  libfuzzer-repro:
+    name: ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    container: openquantumsafe/ci-ubuntu-latest:latest
+    env:
+      CC: clang
+      CXX: clang++
+      CFLAGS: -fsanitize=fuzzer-no-link,address
+      LDFLAGS: -fsanitize=address
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PROBE: the unmodified in-tree KEM harness, seeded so the first
+          # input selects the OpenSSL-AES-backed algorithm.
+          - id: F1-libfuzzer-fuzz_test_kem--openssl-aes
+            target: fuzz_test_kem
+            extra_args: -DOQS_DIST_BUILD=OFF
+            min_build: KEM_frodokem_640_aes
+            seed: "yes"
+            predict: die
+          # CONTROL: exactly what .github/workflows/basic.yml does today.
+          - id: F2-libfuzzer-fuzz_test_sig--ml-dsa-44-CONTROL
+            target: fuzz_test_sig
+            extra_args: ""
+            min_build: SIG_ml_dsa_44
+            seed: "no"
+            predict: survive
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v4
+
+      - name: Configure
+        run: |
+          mkdir build
+          cd build
+          cmake -GNinja ${{ matrix.extra_args }} -DOQS_BUILD_FUZZ_TESTS=ON -DOQS_MINIMAL_BUILD="${{ matrix.min_build }}" ..
+          echo "----- resolved config -----"
+          grep -E 'OQS_USE_OPENSSL|OQS_USE_PTHREADS|OQS_USE_AES_OPENSSL|OQS_USE_SHA2_OPENSSL|OQS_USE_SHA3_OPENSSL' include/oqs/oqsconfig.h
+
+      - name: Build harness
+        run: ninja ${{ matrix.target }}
+        working-directory: build
+
+      - name: Seed corpus
+        if: matrix.seed == 'yes'
+        run: |
+          mkdir -p corpus
+          # fuzz_init_ctx_t = { uint32 random_seed; uint32 algorithm_index; }
+          # algorithm_index 29 selects FrodoKEM-640-AES out of the 41 KEM names.
+          printf '\x01\x00\x00\x00\x1d\x00\x00\x00\x41\x41\x41\x41' > corpus/seed
+          od -An -tx1 corpus/seed
+
+      - name: Run harness and compare against the prediction
+        run: |
+          set +e
+          if [ "${{ matrix.seed }}" = "yes" ]; then
+            ./build/tests/${{ matrix.target }} -runs=64 corpus
+          else
+            ./build/tests/${{ matrix.target }} -max_total_time=30
+          fi
+          rc=$?
+          set -e
+          echo "OBSERVED-EXIT-CODE=$rc"
+          echo "PREDICTED=${{ matrix.predict }}"
+          if [ "${{ matrix.predict }}" = "survive" ]; then
+            if [ "$rc" = "0" ]; then
+              echo "RESULT=PREDICTION-CONFIRMED (harness completed)"
+            else
+              echo "RESULT=PREDICTION-WRONG (expected survive, got exit $rc)"
+              exit 1
+            fi
+          else
+            if [ "$rc" = "0" ]; then
+              echo "RESULT=PREDICTION-WRONG (expected die, but it completed)"
+              exit 1
+            else
+              echo "RESULT=PREDICTION-CONFIRMED (died with exit $rc)"
+            fi
+          fi
