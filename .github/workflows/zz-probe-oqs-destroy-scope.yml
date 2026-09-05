@@ -32,12 +32,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # PROBE: pthreads on, algorithm that uses the OpenSSL AES path.
-          - id: A1-pthreads-on--openssl-aes-kem
+          # Round 1 predicted "die" here and was WRONG: on x86_64,
+          # .CMake/alg_support.cmake:66 turns OQS_USE_AES_OPENSSL OFF because
+          # OQS_USE_AES_INSTRUCTIONS (AES-NI) wins, so FrodoKEM never touches a
+          # fetched EVP object. Prediction corrected to "survive"; this cell now
+          # documents the platform difference against arm64 macOS, where the
+          # same cell dies.
+          - id: A1-pthreads-on--aes-ni-not-openssl-kem
             extra_args: -DOQS_DIST_BUILD=OFF
             kind: kem
             alg: FrodoKEM-640-AES
-            predict: die
+            predict: survive
           # CONTROL: pthreads on, algorithm that touches no fetched object.
           - id: A2-pthreads-on--ml-dsa-44-CONTROL
             extra_args: -DOQS_DIST_BUILD=OFF
@@ -123,12 +128,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # PROBE: the unmodified in-tree KEM harness, seeded so the first
-          # input selects the OpenSSL-AES-backed algorithm.
-          - id: F1-libfuzzer-fuzz_test_kem--openssl-aes
+          # PROBE: the unmodified in-tree KEM harness. Round 1 of this cell was
+          # inconclusive for two reasons, both fixed here: the seed was written
+          # with printf '\xNN', which dash (the workflow shell) does not
+          # interpret, and FrodoKEM does not use OpenSSL AES on x86_64. Now the
+          # seed is written with python3 and SHA3 is routed through OpenSSL, so
+          # ML-KEM-768 depends on a fetched EVP_MD.
+          - id: F1-libfuzzer-fuzz_test_kem--sha3-openssl
             target: fuzz_test_kem
-            extra_args: -DOQS_DIST_BUILD=OFF
-            min_build: KEM_frodokem_640_aes
+            extra_args: -DOQS_DIST_BUILD=OFF -DOQS_USE_SHA3_OPENSSL=ON
+            min_build: KEM_ml_kem_768
             seed: "yes"
             predict: die
           # CONTROL: exactly what .github/workflows/basic.yml does today.
@@ -159,9 +168,14 @@ jobs:
         run: |
           mkdir -p corpus
           # fuzz_init_ctx_t = { uint32 random_seed; uint32 algorithm_index; }
-          # algorithm_index 29 selects FrodoKEM-640-AES out of the 41 KEM names.
-          printf '\x01\x00\x00\x00\x1d\x00\x00\x00\x41\x41\x41\x41' > corpus/seed
-          od -An -tx1 corpus/seed
+          # algorithm_index 20 selects ML-KEM-768 out of the 41 KEM names.
+          # Two distinct files, so libFuzzer runs the enabled algorithm twice
+          # during INITED: the first calls OQS_destroy(), the second is the one
+          # that must survive it. Written with python3, not printf: the
+          # workflow shell is dash, whose printf does not honour \xNN.
+          python3 -c "import struct; [open('corpus/seed%d' % i, 'wb').write(struct.pack('<II', i + 1, 20) + t) for i, t in enumerate((b'AAAA', b'BBBB'))]"
+          od -An -tx1 corpus/seed0
+          od -An -tx1 corpus/seed1
 
       - name: Run harness and compare against the prediction
         run: |
